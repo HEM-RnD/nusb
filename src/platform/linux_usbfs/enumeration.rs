@@ -14,26 +14,59 @@ use crate::Speed;
 #[derive(Debug, Clone)]
 pub struct SysfsPath(pub(crate) PathBuf);
 
-impl SysfsPath {
-    pub(crate) fn read_attr<T: FromStr>(&self, attr: &str) -> Result<T, io::Error>
-    where
-        T: FromStr,
-        T::Err: std::error::Error + Send + Sync + 'static,
-    {
-        let attr_path = self.0.join(attr);
-        let read_res = fs::read_to_string(&attr_path);
-        debug!("sysfs read {attr_path:?}: {read_res:?}");
+#[derive(Debug)]
+pub struct SysfsError(PathBuf, SysfsErrorKind);
 
-        read_res?
-            .trim()
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+#[derive(Debug)]
+enum SysfsErrorKind {
+    Io(io::Error),
+    Parse(String),
+}
+
+impl std::fmt::Display for SysfsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to read sysfs attribute {}: ", self.0.display())?;
+        match &self.1 {
+            SysfsErrorKind::Io(e) => write!(f, "{e}"),
+            SysfsErrorKind::Parse(v) => write!(f, "couldn't parse value {:?}", v.trim()),
+        }
+    }
+}
+
+impl std::error::Error for SysfsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self.1 {
+            SysfsErrorKind::Io(ref e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<SysfsError> for io::Error {
+    fn from(value: SysfsError) -> Self {
+        io::Error::other(Box::new(value))
+    }
+}
+
+impl SysfsPath {
+    fn parse_attr<T, E>(
+        &self,
+        attr: &str,
+        parse: impl FnOnce(&str) -> Result<T, E>,
+    ) -> Result<T, SysfsError> {
+        let attr_path = self.0.join(attr);
+        fs::read_to_string(&attr_path)
+            .map_err(SysfsErrorKind::Io)
+            .and_then(|v| parse(v.trim()).map_err(|_| SysfsErrorKind::Parse(v)))
+            .map_err(|e| SysfsError(attr_path, e))
     }
 
-    fn read_attr_hex<T: FromHexStr>(&self, attr: &str) -> Result<T, io::Error> {
-        let s = self.read_attr::<String>(attr)?;
-        T::from_hex_str(&s)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid hex str"))
+    pub(crate) fn read_attr<T: FromStr>(&self, attr: &str) -> Result<T, SysfsError> {
+        self.parse_attr(attr, |s| s.parse())
+    }
+
+    fn read_attr_hex<T: FromHexStr>(&self, attr: &str) -> Result<T, SysfsError> {
+        self.parse_attr(attr, |s| T::from_hex_str(s.strip_prefix("0x").unwrap_or(s)))
     }
 
     fn children(&self) -> impl Iterator<Item = SysfsPath> {
@@ -83,6 +116,12 @@ pub fn probe_device(path: SysfsPath) -> Result<DeviceInfo, Error> {
         vendor_id: path.read_attr_hex("idVendor")?,
         product_id: path.read_attr_hex("idProduct")?,
         device_version: path.read_attr_hex("bcdDevice")?,
+        usb_version: path.parse_attr("version", |s| {
+            // in sysfs, `bcdUSB`` is formatted as `%2x.%02x, so we have to parse it back.
+            s.split('.')
+                .map(|x| u16::from_hex_str(x))
+                .fold(Ok::<u16, ParseIntError>(0), |a, b| Ok((a? << 8) | b?))
+        })?,
         class: path.read_attr_hex("bDeviceClass")?,
         subclass: path.read_attr_hex("bDeviceSubClass")?,
         protocol: path.read_attr_hex("bDeviceProtocol")?,
