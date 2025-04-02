@@ -12,14 +12,13 @@ use std::{
 use log::{debug, error};
 
 use crate::{
-    platform::macos_iokit::events::add_event_source,
     transfer::{Control, Direction, EndpointType, TransferError, TransferHandle},
     DeviceInfo, Error,
 };
 
 use super::{
-    enumeration::service_by_registry_id,
-    events::EventRegistration,
+    enumeration::{get_integer_property, service_by_registry_id},
+    events::{add_event_source, EventRegistration},
     iokit::{call_iokit_function, check_iokit_return},
     iokit_c::IOUSBDevRequestTO,
     iokit_usb::{EndpointInfo, IoKitDevice, IoKitInterface},
@@ -203,7 +202,16 @@ impl MacDevice {
         let intf_service = self
             .device
             .create_interface_iterator()?
-            .nth(interface_number as usize)
+            .find(|io_service| {
+                    let current_number = get_integer_property(io_service, "bInterfaceNumber");
+                    let found = current_number == Some(interface_number as i64);
+                    debug!(
+                        "Looking for interface to claim [n={interface_number}], examining interface [n={}]{}",
+                        current_number.map(|n| n.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                        found.then(|| " (found)").unwrap_or("")
+                    );
+                    found
+                })
             .ok_or(Error::new(ErrorKind::NotFound, "interface not found"))?;
 
         let mut interface = IoKitInterface::new(intf_service)?;
